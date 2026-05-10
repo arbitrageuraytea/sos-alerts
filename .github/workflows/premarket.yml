@@ -1,0 +1,44 @@
+name: Premarket Filter
+
+on:
+  schedule:
+    # 08:45 ET on weekdays.  EDT = UTC-4 -> 12:45 UTC.  EST = UTC-5 -> 13:45 UTC.
+    # We schedule both; the script is idempotent (reset-and-write).
+    - cron: "45 12 * * 1-5"
+    - cron: "45 13 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Limit ticker count for a quick test (0 = all)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: write   # to commit eligible.json back to the repo
+
+jobs:
+  filter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run premarket filter
+        env:
+          LIMIT: ${{ github.event.inputs.limit || '0' }}
+        run: python premarket_filter.py
+
+      - name: Commit eligible list
+        run: |
+          git config user.name  "sos-bot"
+          git config user.email "sos-bot@users.noreply.github.com"
+          git add state/eligible.json state/sent_today.json
+          git diff --cached --quiet || git commit -m "premarket: refresh eligible list"
+          git push

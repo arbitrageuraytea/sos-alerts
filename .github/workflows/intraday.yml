@@ -1,0 +1,46 @@
+name: Intraday Scan
+
+on:
+  schedule:
+    # Every 5 minutes during US market hours, weekdays.
+    # 9:30-16:00 ET.  EDT = 13:30-20:00 UTC.  EST = 14:30-21:00 UTC.
+    # Schedule both windows to cover DST shifts; sent_today.json prevents double-fires.
+    - cron: "*/5 13-20 * * 1-5"
+    - cron: "*/5 14-21 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # to commit sent_today.json updates
+
+concurrency:
+  group: intraday-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run intraday scan
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python intraday_scan.py
+
+      - name: Commit sent log
+        run: |
+          git config user.name  "sos-bot"
+          git config user.email "sos-bot@users.noreply.github.com"
+          git pull --rebase --autostash || true
+          git add state/sent_today.json || true
+          git diff --cached --quiet || git commit -m "intraday: update sent log"
+          git push || true
