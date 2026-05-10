@@ -41,6 +41,14 @@ CHUNK = 200          # tickers per yfinance batch download
 LOOKBACK_DAYS = 120  # daily bars per ticker
 MAX_WORKERS_INFO = 12
 
+# Quality gates - kill SPACs, preferreds, penny stocks, illiquid junk
+MIN_PRICE = 5.0
+MIN_ATR_PCT = 0.01           # ATR(20) >= 1% of price (rejects dead-flat SPACs)
+MIN_AVG_VOLUME = 200_000     # daily avg volume floor
+MIN_MARKET_CAP = 100_000_000 # $100M
+EXCLUDED_INDUSTRIES = {"Shell Companies"}
+EXCLUDED_QUOTE_TYPES = {"ETF", "MUTUALFUND", "CURRENCY", "CRYPTOCURRENCY", "INDEX", "FUTURE"}
+
 
 def _r_squared(closes: np.ndarray) -> float:
     if len(closes) < 5:
@@ -73,6 +81,14 @@ def passes_2lynch(df: pd.DataFrame) -> tuple[bool, dict]:
     closes = df["Close"].to_numpy()
     pct = pd.Series(closes).pct_change().to_numpy()  # last value is NaN-safe
 
+    # ----- Quality gates: price + volatility floors -----
+    last_close = float(closes[-1])
+    if last_close < MIN_PRICE:
+        return False, {}
+    atr20 = _atr(df, 20)
+    if last_close > 0 and atr20 / last_close < MIN_ATR_PCT:
+        return False, {}
+
     # ----- 2: at least 2 of the last 5 sessions tight (|chg| <= 1.5%) -----
     last5 = pct[-5:]
     tight_count = int(np.sum(np.abs(last5) <= 0.015))
@@ -92,7 +108,6 @@ def passes_2lynch(df: pd.DataFrame) -> tuple[bool, dict]:
         return False, {}
 
     # ----- N: prior day narrow-range or red -----
-    atr20 = _atr(df, 20)
     prev = df.iloc[-1]  # most recent completed daily bar
     prev_range = float(prev["High"] - prev["Low"])
     prev_red = float(prev["Close"]) < float(prev["Open"])
@@ -172,11 +187,13 @@ def fetch_metadata(ticker: str) -> dict | None:
     industry = info.get("industry") or ""
     name = info.get("shortName") or info.get("longName") or ticker
     summary = info.get("longBusinessSummary") or ""
+    quote_type = (info.get("quoteType") or "").upper()
     return {
         "sector": sector,
         "industry": industry,
         "name": name,
         "summary": summary,
+        "quote_type": quote_type,
         "peg": info.get("pegRatio"),
         "earnings_growth": info.get("earningsGrowth"),
         "revenue_growth": info.get("revenueGrowth"),
@@ -247,6 +264,17 @@ def main():
         for fut in as_completed(futs):
             tk, meta = fut.result()
             if meta is None:
+                continue
+            # Quality gates on metadata
+            if meta.get("quote_type") in EXCLUDED_QUOTE_TYPES:
+                continue
+            if meta.get("industry") in EXCLUDED_INDUSTRIES:
+                continue
+            mc = meta.get("market_cap")
+            if mc is not None and mc < MIN_MARKET_CAP:
+                continue
+            av = meta.get("avg_volume")
+            if av is not None and av < MIN_AVG_VOLUME:
                 continue
             score, lynch_notes = lynch_score(meta)
             themes = tag_themes(meta["summary"], meta["name"])
