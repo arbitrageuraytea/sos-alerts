@@ -1,53 +1,48 @@
-"""Premarket filter: build the eligible list for today's intraday scanner.
+"""Premarket job: build the full US-stock universe with 2LYNCH state.
 
-2LYNCH framework (run on daily candles, all US stocks):
+For every US-listed common stock that passes basic quality gates, compute the
+2LYNCH daily-chart features and a passes_2lynch boolean. Output:
+state/universe.json keyed by ticker.
+
+The intraday scanner reads this and uses passes_2lynch as a hard gate on alerts.
+
+Quality gates (drop the obviously irrelevant before computing features):
+  - last close >= $5
+  - ATR(20) / last close >= 1%   (kills SPACs and dead-flat instruments)
+  - >= 30 daily bars available
+
+2LYNCH (run on daily candles):
   2 - >=2 of last 5 days are tight (|chg| <= 1.5%)
   L - linearity of prior trend (R^2 of last 20 closes >= 0.7)
-  Y - young trend: <=2 prior breakouts above the 20-day high in the last 60 days
+  Y - young trend: <=3 prior breakouts above the 20-day high in the last 60 days
   N - day before today is narrow-range (<=0.5*ATR20) OR red
   C - consolidation 5-10 days: depth <=15%, <=1 day with chg <= -4%
 
-Plus: soft sector preference (Tech / Healthcare / Consumer Cyclical),
-      Lynch-style fundamentals (best-effort, NaN-tolerant),
-      theme tagging from longBusinessSummary.
-
-Output: state/eligible.json with one entry per qualifying ticker.
+Also stored: recent_3day_abs_pct_sum (used by intraday for range-expansion gate)
+and consolidation_high (for "true breakout above the base" verification).
 """
 from __future__ import annotations
 
 import json
-import math
 import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from themes import tag_themes
 from tickers import all_us_tickers
 
 STATE_DIR = Path(__file__).parent / "state"
 STATE_DIR.mkdir(exist_ok=True)
 
-PREFERRED_SECTORS = {
-    "Technology", "Healthcare", "Consumer Cyclical", "Communication Services",
-}
+CHUNK = 200
+LOOKBACK_DAYS = 120
 
-CHUNK = 200          # tickers per yfinance batch download
-LOOKBACK_DAYS = 120  # daily bars per ticker
-MAX_WORKERS_INFO = 12
-
-# Quality gates - kill SPACs, preferreds, penny stocks, illiquid junk
 MIN_PRICE = 5.0
-MIN_ATR_PCT = 0.01           # ATR(20) >= 1% of price (rejects dead-flat SPACs)
-MIN_AVG_VOLUME = 200_000     # daily avg volume floor
-MIN_MARKET_CAP = 100_000_000 # $100M
-EXCLUDED_INDUSTRIES = {"Shell Companies"}
-EXCLUDED_QUOTE_TYPES = {"ETF", "MUTUALFUND", "CURRENCY", "CRYPTOCURRENCY", "INDEX", "FUTURE"}
+MIN_ATR_PCT = 0.01
 
 
 def _r_squared(closes: np.ndarray) -> float:
@@ -73,51 +68,42 @@ def _atr(df: pd.DataFrame, n: int = 20) -> float:
     return float(tr.tail(n).mean()) if len(tr) >= n else float(tr.mean())
 
 
-def passes_2lynch(df: pd.DataFrame) -> tuple[bool, dict]:
-    """Apply the 2LYNC daily-chart criteria. df has Open/High/Low/Close/Volume."""
+def compute_features(df: pd.DataFrame) -> dict | None:
+    """Compute features + 2LYNCH pass/fail. Returns None if doesn't clear quality gates."""
     if df is None or len(df) < 30:
-        return False, {}
+        return None
     df = df.dropna().tail(60).copy()
-    closes = df["Close"].to_numpy()
-    pct = pd.Series(closes).pct_change().to_numpy()  # last value is NaN-safe
+    if len(df) < 30:
+        return None
 
-    # ----- Quality gates: price + volatility floors -----
+    closes = df["Close"].to_numpy()
     last_close = float(closes[-1])
     if last_close < MIN_PRICE:
-        return False, {}
+        return None
     atr20 = _atr(df, 20)
     if last_close > 0 and atr20 / last_close < MIN_ATR_PCT:
-        return False, {}
+        return None
 
-    # ----- 2: at least 2 of the last 5 sessions tight (|chg| <= 1.5%) -----
+    pct = pd.Series(closes).pct_change().to_numpy()
+
     last5 = pct[-5:]
     tight_count = int(np.sum(np.abs(last5) <= 0.015))
     strict_tight_count = int(np.sum(np.abs(last5) <= 0.010))
-    if tight_count < 2:
-        return False, {}
 
-    # ----- L: linearity of last 20 closes -----
     r2 = _r_squared(closes[-20:])
-    if r2 < 0.7:
-        return False, {}
 
-    # ----- Y: young trend - <=2 prior closes above rolling-20 high in last 60 -----
     rolling_high = pd.Series(df["High"]).rolling(20).max().shift(1).to_numpy()
     breakouts = int(np.sum(closes[-60:] > rolling_high[-60:]))
-    if breakouts > 3:
-        return False, {}
 
-    # ----- N: prior day narrow-range or red -----
-    prev = df.iloc[-1]  # most recent completed daily bar
+    prev = df.iloc[-1]
     prev_range = float(prev["High"] - prev["Low"])
     prev_red = float(prev["Close"]) < float(prev["Open"])
-    if not (prev_range <= 0.5 * atr20 or prev_red):
-        return False, {}
+    n_ok = (prev_range <= 0.5 * atr20) or prev_red
 
-    # ----- C: consolidation 5-10 days, depth<=15%, <=1 day with chg<=-4% -----
     cons_ok = False
     cons_len = 0
     cons_depth = 0.0
+    cons_high = float("nan")
     for window in (10, 9, 8, 7, 6, 5):
         seg = df.tail(window)
         hi, lo = float(seg["High"].max()), float(seg["Low"].min())
@@ -127,28 +113,42 @@ def passes_2lynch(df: pd.DataFrame) -> tuple[bool, dict]:
             cons_ok = True
             cons_len = window
             cons_depth = depth
+            cons_high = hi
             break
-    if not cons_ok:
-        return False, {}
 
-    info = {
+    passes = (
+        tight_count >= 2
+        and r2 >= 0.7
+        and breakouts <= 3
+        and n_ok
+        and cons_ok
+    )
+
+    # max of last 3 days' |%chg| for the intraday range-expansion gate
+    # (today's move must exceed each of these to be a genuine range expansion)
+    last3 = pct[-3:]
+    last3 = last3[~np.isnan(last3)]
+    recent_3day_max_abs_pct = float(np.max(np.abs(last3))) if len(last3) else 0.0
+
+    return {
+        "passes_2lynch": bool(passes),
         "tight_count_last5": tight_count,
         "strict_tight_count_last5": strict_tight_count,
         "linearity_r2": round(r2, 3),
         "prior_breakouts_60d": breakouts,
-        "atr20": round(atr20, 3),
+        "atr20": round(atr20, 4),
+        "atr_pct": round(atr20 / last_close, 4) if last_close else 0.0,
+        "n_rule_ok": bool(n_ok),
+        "consolidation_ok": bool(cons_ok),
         "consolidation_days": cons_len,
         "consolidation_depth_pct": round(cons_depth * 100, 2),
-        "prev_close": round(float(prev["Close"]), 4),
-        "prev_high": round(float(prev["High"]), 4),
-        "prev_low": round(float(prev["Low"]), 4),
-        "consolidation_high": round(float(df.tail(cons_len)["High"].max()), 4),
+        "consolidation_high": round(cons_high, 4) if not np.isnan(cons_high) else None,
+        "prev_close": round(last_close, 4),
+        "recent_3day_max_abs_pct": round(recent_3day_max_abs_pct, 4),
     }
-    return True, info
 
 
 def fetch_daily_batch(tickers: list[str]) -> dict[str, pd.DataFrame]:
-    """yfinance batch download. Returns {ticker: df} for tickers that returned data."""
     out: dict[str, pd.DataFrame] = {}
     try:
         data = yf.download(
@@ -170,62 +170,9 @@ def fetch_daily_batch(tickers: list[str]) -> dict[str, pd.DataFrame]:
                 if len(df) >= 30:
                     out[t] = df
     else:
-        # single-ticker case
         if len(data) >= 30:
             out[tickers[0]] = data
     return out
-
-
-def fetch_metadata(ticker: str) -> dict | None:
-    """Pull sector + Lynch fundamentals + business summary. Tolerant to missing fields."""
-    try:
-        t = yf.Ticker(ticker)
-        info = t.info or {}
-    except Exception:
-        return None
-    sector = info.get("sector") or ""
-    industry = info.get("industry") or ""
-    name = info.get("shortName") or info.get("longName") or ticker
-    summary = info.get("longBusinessSummary") or ""
-    quote_type = (info.get("quoteType") or "").upper()
-    return {
-        "sector": sector,
-        "industry": industry,
-        "name": name,
-        "summary": summary,
-        "quote_type": quote_type,
-        "peg": info.get("pegRatio"),
-        "earnings_growth": info.get("earningsGrowth"),
-        "revenue_growth": info.get("revenueGrowth"),
-        "debt_to_equity": info.get("debtToEquity"),
-        "profit_margin": info.get("profitMargins"),
-        "market_cap": info.get("marketCap"),
-        "shares_outstanding": info.get("sharesOutstanding"),
-        "avg_volume": info.get("averageVolume"),
-    }
-
-
-def lynch_score(meta: dict) -> tuple[int, list[str]]:
-    """Best-effort Lynch fundamentals score (0-4). NaN-tolerant."""
-    score = 0
-    notes = []
-    peg = meta.get("peg")
-    if peg is not None and not (isinstance(peg, float) and math.isnan(peg)) and 0 < peg < 1:
-        score += 1
-        notes.append(f"PEG={peg:.2f}")
-    eg = meta.get("earnings_growth")
-    if eg is not None and not (isinstance(eg, float) and math.isnan(eg)) and eg > 0.20:
-        score += 1
-        notes.append(f"EarnGrowth={eg*100:.0f}%")
-    de = meta.get("debt_to_equity")
-    if de is not None and not (isinstance(de, float) and math.isnan(de)) and 0 <= de < 50:
-        score += 1
-        notes.append(f"D/E={de:.0f}")
-    pm = meta.get("profit_margin")
-    if pm is not None and not (isinstance(pm, float) and math.isnan(pm)) and pm > 0:
-        score += 1
-        notes.append("Profitable")
-    return score, notes
 
 
 def main():
@@ -234,79 +181,35 @@ def main():
     tickers = all_us_tickers()
     print(f"  {len(tickers)} tickers")
 
-    # Optional: trim by env var for testing
     limit = int(os.environ.get("LIMIT", "0"))
     if limit > 0:
         tickers = tickers[:limit]
         print(f"  LIMIT={limit} -> {len(tickers)} tickers")
 
-    print("Phase 1: daily-chart 2LYNC filter...")
-    candidates: dict[str, dict] = {}
+    print("Computing 2LYNCH features...")
+    universe: dict[str, dict] = {}
+    passes = 0
     for i in range(0, len(tickers), CHUNK):
         chunk = tickers[i : i + CHUNK]
         print(f"  batch {i//CHUNK + 1}/{(len(tickers)-1)//CHUNK + 1}: {len(chunk)} tickers")
         bars = fetch_daily_batch(chunk)
         for tk, df in bars.items():
-            ok, info = passes_2lynch(df)
-            if ok:
-                candidates[tk] = info
-    print(f"  {len(candidates)} tickers passed 2LYNC technicals")
+            feats = compute_features(df)
+            if feats is None:
+                continue
+            universe[tk] = feats
+            if feats["passes_2lynch"]:
+                passes += 1
 
-    print("Phase 2: metadata + sector + Lynch + theme...")
-    eligible: dict[str, dict] = {}
-
-    def enrich(tk: str) -> tuple[str, dict | None]:
-        meta = fetch_metadata(tk)
-        return tk, meta
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS_INFO) as ex:
-        futs = {ex.submit(enrich, tk): tk for tk in candidates}
-        for fut in as_completed(futs):
-            tk, meta = fut.result()
-            if meta is None:
-                continue
-            # Quality gates on metadata
-            if meta.get("quote_type") in EXCLUDED_QUOTE_TYPES:
-                continue
-            if meta.get("industry") in EXCLUDED_INDUSTRIES:
-                continue
-            mc = meta.get("market_cap")
-            if mc is not None and mc < MIN_MARKET_CAP:
-                continue
-            av = meta.get("avg_volume")
-            if av is not None and av < MIN_AVG_VOLUME:
-                continue
-            score, lynch_notes = lynch_score(meta)
-            themes = tag_themes(meta["summary"], meta["name"])
-            sector_match = meta["sector"] in PREFERRED_SECTORS
-            entry = {
-                **candidates[tk],
-                "name": meta["name"],
-                "sector": meta["sector"],
-                "industry": meta["industry"],
-                "preferred_sector": sector_match,
-                "themes": themes,
-                "lynch_score": score,
-                "lynch_notes": lynch_notes,
-                "market_cap": meta.get("market_cap"),
-                "avg_volume": meta.get("avg_volume"),
-            }
-            eligible[tk] = entry
-
-    out_path = STATE_DIR / "eligible.json"
+    out_path = STATE_DIR / "universe.json"
     with open(out_path, "w") as f:
-        json.dump(eligible, f, indent=2, default=str)
-    # reset today's sent log
+        json.dump(universe, f, separators=(",", ":"), default=str)
     with open(STATE_DIR / "sent_today.json", "w") as f:
         json.dump({}, f)
 
     elapsed = time.time() - t0
-    print(f"\nDone. {len(eligible)} eligible tickers written to {out_path}")
-    print(f"Elapsed: {elapsed:.1f}s")
-    if eligible:
-        sample = list(eligible.items())[:10]
-        for tk, e in sample:
-            print(f"  {tk:6s} {e['sector']:24s} R²={e['linearity_r2']} cons={e['consolidation_days']}d themes={e['themes']}")
+    print(f"\nDone. {len(universe)} tickers in universe ({passes} pass 2LYNCH).")
+    print(f"Written to {out_path}.  Elapsed: {elapsed:.1f}s")
 
 
 if __name__ == "__main__":

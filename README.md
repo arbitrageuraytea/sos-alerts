@@ -5,8 +5,10 @@ GitHub Actions (free) and pings you on Telegram.
 
 ## What it scans for
 
-**Premarket (08:45 ET):** filters all US-listed common stocks down to a daily
-candidate list using the **2LYNCH** framework on daily candles:
+**Premarket (08:45 ET):** computes the **2LYNCH** daily-chart features for
+every US-listed common stock that clears basic quality gates (price ≥ $5,
+ATR/price ≥ 1%, ≥30 daily bars). Output: `state/universe.json` with each
+ticker's metrics + `passes_2lynch: true/false`.
 
 | | Rule | Threshold |
 |---|---|---|
@@ -16,18 +18,21 @@ candidate list using the **2LYNCH** framework on daily candles:
 | N | Narrow / red day pre-breakout | prior day range ≤ 0.5×ATR(20) OR red |
 | C | Shallow consolidation | 5–10 day window, depth ≤ 15%, ≤1 day with `chg ≤ −4%` |
 
-Plus: soft preference for Tech / Healthcare / Consumer Cyclical / Communication
-sectors; Lynch-style fundamentals score (PEG<1, earnings growth >20%, low D/E,
-profitable); theme tagging (AI, Quantum, Semis, Space, Defense, Nuclear, …) from
-the company business summary.
+**Intraday (every 5 min, 9:30–16:00 ET):** scans the full universe (not just
+2LYNCH-passing tickers) for today's running OHLCV. An alert fires only when
+**all** of these are true:
 
-**Intraday (every 5 min, 9:30–16:00 ET):** for each eligible ticker checks:
-
-- price up ≥ 4% from prior close
-- close in top 25% of day's range (the "75% of high" rule, **H**)
 - cumulative volume ≥ 6M → 🟡 **EARLY** alert
 - cumulative volume ≥ 8.9M → 🟢 **CONFIRMED** alert
-- gap-up flag (open ≥ +2%) → ⚠️ tagged in alert as fade risk
+- price up ≥ 4% from prior close
+- close in top 25% of day's range (the "75% of high" rule, **H**)
+- **range expansion:** today's `|%chg| > max(|%chg D-1|, |%chg D-2|, |%chg D-3|)`
+- `passes_2lynch == True` (the SoS pattern in daily history)
+
+Sector tag (Tech / Healthcare / Consumer Cyclical / Communication = ✓),
+Lynch-style fundamentals score (PEG<1, earnings growth >20%, low D/E,
+profitable), and theme tagging (AI, Quantum, Semis, Space, Defense, Nuclear, …)
+are fetched at alert time and attached as labels — they don't gate the alert.
 
 Each ticker fires at most one EARLY and one CONFIRMED alert per day.
 
@@ -65,7 +70,7 @@ In the GitHub UI: Actions tab → "Premarket Filter" → "Run workflow" → set
 `limit` to e.g. `500` for a 2-min smoke test. Then "Intraday Scan" → "Run
 workflow". Check the run logs and your Telegram.
 
-For a full premarket run, leave `limit` at 0 (default). Expect ~10–20 min for
+For a full premarket run, leave `limit` at 0 (default). Expect ~15–30 min for
 ~7000 tickers.
 
 ## Local testing
@@ -92,7 +97,7 @@ telegram_alert.py       Telegram sender helper
 tickers.py              US ticker universe from NASDAQ Trader
 themes.py               Theme keyword dict (edit to add/remove themes)
 .github/workflows/      GitHub Actions cron jobs
-state/eligible.json     Today's eligible candidates (rebuilt each morning)
+state/universe.json     Full universe + 2LYNCH state (rebuilt each morning)
 state/sent_today.json   Per-day de-dupe log
 ```
 

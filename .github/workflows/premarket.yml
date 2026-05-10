@@ -19,7 +19,7 @@ permissions:
 jobs:
   filter:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -39,6 +39,6 @@ jobs:
         run: |
           git config user.name  "sos-bot"
           git config user.email "sos-bot@users.noreply.github.com"
-          git add state/eligible.json state/sent_today.json
+          git add state/universe.json state/sent_today.json
           git diff --cached --quiet || git commit -m "premarket: refresh eligible list"
           git push
